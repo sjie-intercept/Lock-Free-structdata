@@ -62,7 +62,7 @@ class LockFreeLinklist {
 
 private:
 
-    struct Node {
+    struct alignas(8) Node {
         K key;
         V value;
         std::atomic<bool> changing;
@@ -92,7 +92,27 @@ private :
         return reinterpret_cast<Node*>(reinterpret_cast<uint64_t>(node->next.load(std::memory_order_acquire)) & ~uint64_t(1));
     }
 
-    void try_remove() {
+    Node* get_remove_next(Node* node) {
+        return reinterpret_cast<Node*>(reinterpret_cast<uint64_t>(node->next.load(std::memory_order_acquire)) & ~uint64_t(2));
+    }
+
+    void try_remove_from_link(Node* prev, Node* node) {
+        if (!is_remove(node)) return;
+        Node* next = get_next(node);
+        Node* remo_next = get_remove_next(node);
+        Node* mark_next = reinterpret_cast<Node*>(reinterpret_cast<uint64_t>(next) | 2);
+        if (!node->next.compare_exchange_strong(remo_next, mark_next, std::memory_order_acq_rel)) {
+            return;
+        }
+        if (!prev->next.compare_exchange_strong(node, next, std::memory_order_acq_rel)) {
+            node->next.store(remo_next, std::memory_order_release);
+            return;
+        }
+        DeleteNode deletenode = {node, epoch->get_epoch()};
+        remove_set->push(deletenode);
+    }
+
+    void try_remove_to_pool() {
         DeleteNode deletenode;
         while (remove_set.pop(deletenode)) {
             if (deletenode->version > epoch->minepoch()) {
@@ -135,7 +155,7 @@ public:
     }
 
     void insert(const K& key, const V& value) {
-        try_remove();
+        try_remove_to_pool();
         int index = epoch->lockepoch();
 
         Node* new_node = pool->allocate();
@@ -150,6 +170,7 @@ public:
             Node* prev = &head;
             Node* node = prev->next.load(std::memory_order_acquire);
             while (node) {
+                try_remove_from_link(prev, node);
                 if (!is_remove(node) && node->key == key) {
                     break;
                 }
@@ -163,6 +184,7 @@ public:
                     node->changing.store(is_not_changing, std::memory_order_release);
                 }
                 pool->deallocate(new_node);
+                break;
             }
             if(prev->next.compare_exchange_strong(node, new_node, std::memory_order_acq_rel)) {
                 break;
@@ -173,12 +195,15 @@ public:
     }
 
     V search(const K& key) {
-        try_remove();
+        try_remove_to_pool();
         int index = epoch->lockepoch();
 
+        Node* prev = &head;
         Node* node = head.next.load(std::memory_order_acquire);
         while (node) {
+            try_remove_from_link(prev, node);
             if (!is_remove(node) && node->key == key) break;
+            prev = node;
             node = get_next(node);
         }
         V value;
@@ -188,30 +213,23 @@ public:
     }
 
     void remove(const K& key) {
-        try_remove();
+        try_remove_to_pool();
         int index = epoch->lockepoch();
 
-        while (true) {
-            Node* prev = &head;
-            Node* node = prev->next.load(std::memory_order_acquire);
-            while (node) {
-                if (!is_remove(node) && node->key == key) break;
-                prev = node;
-                node = get_next(node);
-            }
-            if (node == nullptr) break;
+        Node* prev = &head;
+        Node* node = prev->next.load(std::memory_order_acquire);
+        while (node) {
+            try_remove_from_link(prev, node);
+            if (!is_remove(node) && node->key == key) break;
+            prev = node;
+            node = get_next(node);
+        }
+
+        if (node != nullptr) {
             Node* next = get_next(node);
             Node* mark_next = reinterpret_cast<Node*>(reinterpret_cast<uint64_t>(next) | 1);
-            if (!node->next.compare_exchange_strong(next, mark_next, std::memory_order_acq_rel)) {
-                continue;
-            }
-            if (!prev->next.compare_exchange_strong(node, next, std::memory_order_acq_rel)) {
-                node->next.store(next, std::memory_order_release);
-                continue;
-            }
-            DeleteNode deletenode = {node, epoch->get_epoch()};
-            remove_set->push(deletenode);
-            break;
+            node->next.compare_exchange_strong(next, mark_next, std::memory_order_acq_rel);
+            try_remove_from_link(prev, node);
         }
 
         epoch->unlockepoch(index);

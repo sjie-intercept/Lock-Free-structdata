@@ -14,7 +14,7 @@ private:
     };
 
     std::atomic<uint64_t> top;
-    LockFreeMemoryPool<Node*>* pool;
+    LockFreeMemoryPool<Node>* pool;
 
     static constexpr uint64_t ptr_mask = 0x0000ffffffffffff;
 

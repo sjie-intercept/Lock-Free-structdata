@@ -126,8 +126,9 @@ public:
             pool->deallocate(deletenode.node);
         }
         while (node) {
+            Node* next = get_next(node);
             pool->deallocate(node);
-            node = get_next(node);
+            node = next;
         }
     }
 
